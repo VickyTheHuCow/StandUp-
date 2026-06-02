@@ -1,4 +1,4 @@
-# StandUp! — webcam sit-detector that escalates a PiShock
+# StandUp! — webcam sit-detector that suppors PiShock
 
 A Windows Python desktop app. A webcam watches your posture; if you stay seated
 past a time limit it sends a short, low-power shock to a PiShock device, then
