@@ -1,0 +1,6 @@
+numpy<2
+opencv-contrib-python==4.10.0.84
+mediapipe==0.10.21
+websocket-client>=1.6
+requests>=2.31
+pillow>=10.0
