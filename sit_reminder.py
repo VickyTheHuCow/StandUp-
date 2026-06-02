@@ -111,24 +111,19 @@ class Config:
     # --- PiShock credentials ---
     username: str = ""
     api_key: str = ""
-    share_code: str = ""          # legacy / optional; not needed for your own device
-    shocker_id: str = ""          # numeric Shocker ID or name; blank = auto-pick first
     app_name: str = "StandUp Reminder"
 
-    # --- Timing ---
+    # --- Timing (global, shared by all shockers) ---
     sit_limit_minutes: float = 15.0      # how long you may sit before shocks begin
-    escalation_interval_s: float = 30.0  # increase intensity every N seconds
+    escalation_interval_s: float = 30.0  # all shockers escalate every N seconds
     min_stand_seconds: float = 60.0      # how long you must stand for the timer to reset
     warn_before_shock: bool = True       # buzz before the first shock of a cycle
     warn_lead_seconds: float = 5.0       # how long before first shock to warn
 
-    # --- Shock escalation ---
-    start_intensity: int = 10            # first-shock intensity (1-100)
-    start_duration: int = 1              # first-shock duration in seconds (1-15)
-    intensity_step: int = 5              # intensity added each escalation step
-    duration_step: int = 0              # duration added each escalation step
-    max_intensity: int = 40             # ceiling the escalation cannot exceed
-    max_duration: int = 5               # ceiling the escalation cannot exceed
+    # --- Per-shocker escalation curves ---
+    # Each entry: {id, name, enabled, start_intensity, start_duration,
+    #              intensity_step, duration_step, max_intensity, max_duration}
+    shockers: list = field(default_factory=list)
 
     # --- Detection ---
     camera_index: int = 0
@@ -140,20 +135,18 @@ class Config:
     # --- Runaway guard ---
     safety_timeout_minutes: float = 5.0  # auto-disarm if continuously shocking this long
 
+    # --- Legacy fields (kept so old config files load; migrated into `shockers`) ---
+    share_code: str = ""
+    shocker_id: str = ""
+    start_intensity: int = 10
+    start_duration: int = 1
+    intensity_step: int = 5
+    duration_step: int = 0
+    max_intensity: int = 40
+    max_duration: int = 5
+
     def clamp(self):
         """Enforce sane ranges and the absolute hardware ceilings."""
-        self.start_intensity = int(_bound(self.start_intensity, 1, ABS_MAX_INTENSITY))
-        self.max_intensity = int(_bound(self.max_intensity, 1, ABS_MAX_INTENSITY))
-        # max may not be below start
-        self.max_intensity = max(self.max_intensity, self.start_intensity)
-
-        self.start_duration = int(_bound(self.start_duration, 1, ABS_MAX_DURATION))
-        self.max_duration = int(_bound(self.max_duration, 1, ABS_MAX_DURATION))
-        self.max_duration = max(self.max_duration, self.start_duration)
-
-        self.intensity_step = int(_bound(self.intensity_step, 0, ABS_MAX_INTENSITY))
-        self.duration_step = int(_bound(self.duration_step, 0, ABS_MAX_DURATION))
-
         self.sit_limit_minutes = _bound(self.sit_limit_minutes, 0.1, 600)
         self.escalation_interval_s = _bound(self.escalation_interval_s, 5, 600)
         self.min_stand_seconds = _bound(self.min_stand_seconds, 1, 3600)
@@ -161,7 +154,14 @@ class Config:
         self.stand_sensitivity = _bound(self.stand_sensitivity, 0.02, 0.5)
         self.confirm_frames = int(_bound(self.confirm_frames, 1, 60))
         self.safety_timeout_minutes = _bound(self.safety_timeout_minutes, 0.5, 60)
+        if not isinstance(self.shockers, list):
+            self.shockers = []
+        self.shockers = [_clamp_shocker(s) for s in self.shockers if isinstance(s, dict)]
         return self
+
+    def enabled_shockers(self):
+        """Configured shockers that are enabled and have an ID."""
+        return [s for s in self.shockers if s.get("enabled") and str(s.get("id", "")).strip()]
 
     @staticmethod
     def load():
@@ -175,6 +175,19 @@ class Config:
                         setattr(cfg, k, v)
             except Exception:
                 pass
+        # Migrate a pre-multi-shocker config into the shockers list.
+        if not cfg.shockers:
+            cfg.shockers = [{
+                "id": str(cfg.shocker_id or "").strip(),
+                "name": "Shocker 1",
+                "enabled": True,
+                "start_intensity": cfg.start_intensity,
+                "start_duration": cfg.start_duration,
+                "intensity_step": cfg.intensity_step,
+                "duration_step": cfg.duration_step,
+                "max_intensity": cfg.max_intensity,
+                "max_duration": cfg.max_duration,
+            }]
         return cfg.clamp()
 
     def save(self):
@@ -184,6 +197,34 @@ class Config:
                 json.dump(asdict(self), f, indent=2)
         except Exception:
             traceback.print_exc()
+
+
+DEFAULT_SHOCKER = {
+    "id": "", "name": "", "enabled": True,
+    "start_intensity": 10, "start_duration": 1,
+    "intensity_step": 5, "duration_step": 0,
+    "max_intensity": 40, "max_duration": 5,
+}
+
+
+def _clamp_shocker(s):
+    """Validate one shocker config dict and enforce the hardware ceilings."""
+    out = dict(DEFAULT_SHOCKER)
+    for k in out:
+        if k in s:
+            out[k] = s[k]
+    out["id"] = str(out["id"]).strip()
+    out["name"] = str(out["name"]).strip()
+    out["enabled"] = bool(out["enabled"])
+    out["start_intensity"] = int(_bound(out["start_intensity"], 1, ABS_MAX_INTENSITY))
+    out["max_intensity"] = max(int(_bound(out["max_intensity"], 1, ABS_MAX_INTENSITY)),
+                               out["start_intensity"])
+    out["start_duration"] = int(_bound(out["start_duration"], 1, ABS_MAX_DURATION))
+    out["max_duration"] = max(int(_bound(out["max_duration"], 1, ABS_MAX_DURATION)),
+                              out["start_duration"])
+    out["intensity_step"] = int(_bound(out["intensity_step"], 0, ABS_MAX_INTENSITY))
+    out["duration_step"] = int(_bound(out["duration_step"], 0, ABS_MAX_DURATION))
+    return out
 
 
 def _bound(v, lo, hi):
@@ -214,33 +255,30 @@ def _normalize_share_code(raw):
 class PiShockClient:
     """Talks to PiShock's current (V2) WebSocket broker.
 
-    Flow: resolve UserID + Shocker/Client IDs from username+API key (HTTP),
-    then open a WebSocket to the broker and PUBLISH operate commands. The old
-    do.pishock.com REST endpoint was retired, which is why share-code POSTs now
-    404. No share code is needed for your own device."""
+    Flow: resolve UserID and the full map of shockers on the account from
+    username+API key (HTTP), then open a WebSocket to the broker and PUBLISH
+    operate commands. Supports operating several shockers at once, each with its
+    own mode/intensity/duration, in a single publish."""
 
     def __init__(self, cfg: Config, logger):
         self.cfg = cfg
         self.log = logger
         self._user_id = None
-        self._client_id = None
-        self._shocker_id = None
-        self._shocker_name = None
-        self._key = None  # (username, api_key, shocker_id) to detect changes
+        self._shockers = {}   # str(shocker_id) -> {shocker_id, client_id, name, paused}
+        self._key = None      # (username, api_key) used to detect credential changes
 
     # ----- discovery ----- #
-    def _discover(self):
+    def _discover(self, force=False):
         if not _WS_OK:
             self.log("The 'websocket-client' package isn't installed. "
                      "Run:  py -m pip install websocket-client")
             return False
         u = self.cfg.username.strip()
         k = self.cfg.api_key.strip()
-        want = str(self.cfg.shocker_id).strip()
         if not (u and k):
             self.log("PiShock: enter your username and API key first.")
             return False
-        if self._shocker_id is not None and (u, k, want) == self._key:
+        if self._shockers and not force and (u, k) == self._key:
             return True
 
         # 1) UserID from API key
@@ -258,7 +296,6 @@ class PiShockClient:
             data = r.json()
         except ValueError:
             data = {}
-        # Find the user id regardless of key casing (API returns "UserId").
         self._user_id = None
         if isinstance(data, dict):
             for kk, vv in data.items():
@@ -272,7 +309,7 @@ class PiShockClient:
             self.log(f"Couldn't read a UserID from the auth response: {str(safe)[:200]}")
             return False
 
-        # 2) Devices / shockers for that user
+        # 2) All devices / shockers for that user
         try:
             r = requests.get(PISHOCK_DEVICES_URL,
                              params={"UserId": self._user_id, "Token": k, "api": "true"},
@@ -285,62 +322,78 @@ class PiShockClient:
             self.log("No PiShock devices found on this account.")
             return False
 
-        chosen = None
-        available = []
+        mapping = {}
         for dev in devices:
             cid = dev.get("clientId")
             for sh in dev.get("shockers", []):
                 sid = sh.get("shockerId")
-                sname = (sh.get("name") or "").strip()
-                available.append(f"{sname or '?'} (id {sid})")
-                if want and want != str(sid) and want.lower() != sname.lower():
+                if sid is None:
                     continue
-                chosen = (cid, sid, sname, sh.get("isPaused", False))
-                break
-            if chosen:
-                break
-
-        if not chosen:
-            self.log("Couldn't match a shocker. Available: "
-                     + (", ".join(available) or "none")
-                     + ". Set 'Shocker ID' in Settings to one of these, or leave it "
-                       "blank to use the first.")
+                mapping[str(sid)] = {
+                    "shocker_id": sid,
+                    "client_id": cid,
+                    "name": (sh.get("name") or "").strip() or f"Shocker {sid}",
+                    "paused": bool(sh.get("isPaused", False)),
+                }
+        if not mapping:
+            self.log("No shockers found on this account.")
             return False
-
-        self._client_id, self._shocker_id, self._shocker_name, paused = chosen
-        self._key = (u, k, want)
-        self.log(f"Using shocker '{self._shocker_name}' (id {self._shocker_id}) "
-                 f"on hub {self._client_id}"
-                 + (" [PAUSED - unpause it on pishock.com]" if paused else "") + ".")
+        self._shockers = mapping
+        self._key = (u, k)
         return True
 
+    def list_shockers(self, log_them=True):
+        """Refresh and return the account's shockers as a list of dicts."""
+        if not self._discover(force=True):
+            return []
+        items = list(self._shockers.values())
+        if log_them:
+            self.log("Your shockers: " + ", ".join(
+                f"{s['name']} = id {s['shocker_id']}"
+                + (" [PAUSED]" if s["paused"] else "")
+                for s in items))
+        return items
+
     # ----- websocket publish ----- #
-    def _publish(self, mode, intensity, duration_s):
+    def operate(self, commands):
+        """Operate one or more shockers in a single publish.
+
+        commands: list of (shocker_id, mode, intensity, duration_seconds).
+        mode is 's' / 'v' / 'b'. Unknown shocker ids are skipped with a note.
+        """
         if not self._discover():
             return False
         u = self.cfg.username.strip()
         k = self.cfg.api_key.strip()
-        duration_ms = int(round(float(duration_s) * 1000))
-        body = {
-            "id": self._shocker_id,
-            "m": mode,
-            "i": int(intensity),
-            "d": duration_ms,
-            "r": True,
-            "l": {
-                "u": self._user_id,
-                "ty": "api",
-                "w": False,
-                "h": False,
-                "o": self.cfg.app_name.strip() or "StandUp Reminder",
-            },
-        }
-        message = {
-            "Operation": "PUBLISH",
-            "PublishCommands": [
-                {"Target": f"c{self._client_id}-ops", "Body": body}
-            ],
-        }
+        pub = []
+        for (sid, mode, intensity, dur_s) in commands:
+            info = self._shockers.get(str(sid).strip())
+            if not info:
+                self.log(f"Shocker id '{sid}' is not on your account; skipping. "
+                         "Use 'List my shockers' to see valid IDs.")
+                continue
+            pub.append({
+                "Target": f"c{info['client_id']}-ops",
+                "Body": {
+                    "id": info["shocker_id"],
+                    "m": mode,
+                    "i": int(intensity),
+                    "d": int(round(float(dur_s) * 1000)),  # broker wants milliseconds
+                    "r": True,
+                    "l": {
+                        "u": self._user_id,
+                        "ty": "api",
+                        "w": False,
+                        "h": False,
+                        "o": self.cfg.app_name.strip() or "StandUp Reminder",
+                    },
+                },
+            })
+        if not pub:
+            self.log("No valid shockers to operate.")
+            return False
+
+        message = {"Operation": "PUBLISH", "PublishCommands": pub}
         url = f"{PISHOCK_WS_URL}?Username={u}&ApiKey={k}"
         try:
             ws = websocket.create_connection(url, timeout=10)
@@ -349,7 +402,6 @@ class PiShockClient:
                      "before 2024-10-15, regenerate it on pishock.com -> Account "
                      "(the broker requires a newer key).")
             return False
-
         try:
             ws.settimeout(6)
             ws.send(json.dumps(message))
@@ -369,10 +421,8 @@ class PiShockClient:
                 if '"iserror":true' in low:
                     self.log(f"PiShock broker error: {resp}")
                     return False
-            if last:
-                self.log(f"No success confirmation from broker. Last message: {last}")
-            else:
-                self.log("No response from broker after publishing.")
+            self.log(f"No success confirmation from broker. Last message: {last}"
+                     if last else "No response from broker after publishing.")
             return False
         except Exception as e:
             self.log(f"WebSocket send/recv failed: {e}")
@@ -383,28 +433,40 @@ class PiShockClient:
             except Exception:
                 pass
 
-    # ----- public operations ----- #
-    def shock(self, intensity, duration):
-        ok = self._publish(OP_SHOCK, intensity, duration)
-        self.log(f"SHOCK {int(intensity)}% / {duration}s -> {'sent' if ok else 'FAILED'}")
+    # ----- convenience for single-shocker test buttons ----- #
+    def _ids_for_test(self):
+        ids = [str(s["id"]).strip() for s in self.cfg.enabled_shockers()]
+        return ids
+
+    def beep(self, duration, ids=None):
+        ids = ids if ids is not None else self._ids_for_test()
+        ok = self.operate([(i, OP_BEEP, 0, duration) for i in ids])
+        self.log(f"beep {duration}s x{len(ids)} -> {'sent' if ok else 'FAILED'}")
         return ok
 
-    def vibrate(self, intensity, duration):
-        ok = self._publish(OP_VIBRATE, intensity, duration)
-        self.log(f"vibrate {int(intensity)}% / {duration}s -> {'sent' if ok else 'FAILED'}")
-        return ok
-
-    def beep(self, duration):
-        ok = self._publish(OP_BEEP, 0, duration)
-        self.log(f"beep {duration}s -> {'sent' if ok else 'FAILED'}")
+    def vibrate(self, intensity, duration, ids=None):
+        ids = ids if ids is not None else self._ids_for_test()
+        ok = self.operate([(i, OP_VIBRATE, intensity, duration) for i in ids])
+        self.log(f"vibrate {int(intensity)}% / {duration}s x{len(ids)} -> "
+                 f"{'sent' if ok else 'FAILED'}")
         return ok
 
     def verify(self):
-        """Resolve the account/shocker and send a test beep over the broker."""
-        if not self._discover():
+        """Resolve the account, list shockers, and beep the enabled ones."""
+        if not self._discover(force=True):
             return False
-        self.log("Account + shocker resolved. Sending a test beep over the broker...")
-        return self.beep(1)
+        self.list_shockers()
+        ids = self._ids_for_test()
+        if not ids:
+            self.log("No shockers are configured/enabled yet. Add one in the "
+                     "Shockers tab (use 'List my shockers' for IDs).")
+            return False
+        # validate configured ids against the account
+        unknown = [i for i in ids if i not in self._shockers]
+        if unknown:
+            self.log(f"These configured IDs aren't on your account: {', '.join(unknown)}")
+        self.log("Sending a test beep to your enabled shocker(s)...")
+        return self.beep(1, ids=ids)
 
 
 
@@ -421,6 +483,7 @@ class SharedState:
     shocking: bool = False
     current_intensity: int = 0
     current_duration: int = 0
+    shock_summary: str = ""           # per-shocker current levels, e.g. "left 20%/2s"
     status_text: str = "Idle"
     baseline_set: bool = False
     calibrate_request: bool = False
@@ -447,10 +510,11 @@ class PoseMonitor(threading.Thread):
         # Cycle / escalation bookkeeping
         self.shock_mode = False
         self.shock_mode_started = 0.0
-        self.cur_intensity = cfg.start_intensity
-        self.cur_duration = cfg.start_duration
+        self.enabled = []        # snapshot of enabled shocker configs for this cycle
+        self.cur = {}            # shocker id -> {"i": intensity, "d": duration}
         self.last_action_time = 0.0
         self.warned = False
+        self._warned_no_shockers = False
 
     def stop(self):
         self._stop.set()
@@ -504,12 +568,13 @@ class PoseMonitor(threading.Thread):
     def _reset_cycle(self):
         self.shock_mode = False
         self.warned = False
-        self.cur_intensity = self.cfg.start_intensity
-        self.cur_duration = self.cfg.start_duration
+        self.enabled = []
+        self.cur = {}
         with self.state.lock:
             self.state.shocking = False
             self.state.current_intensity = 0
             self.state.current_duration = 0
+            self.state.shock_summary = ""
 
     def _fire_async(self, fn, *args):
         threading.Thread(target=fn, args=args, daemon=True).start()
@@ -604,38 +669,54 @@ class PoseMonitor(threading.Thread):
                 # ----- decide on shock actions ----- #
                 if posture == "SITTING" and sit_acc >= sit_limit_s:
                     if not self.shock_mode:
-                        self.shock_mode = True
-                        self.shock_mode_started = now
-                        self.warned = False
-                        self.last_action_time = 0.0
-                        self.cur_intensity = self.cfg.start_intensity
-                        self.cur_duration = self.cfg.start_duration
-                        self.log("Sit limit reached -> entering shock mode.")
+                        self.enabled = [_clamp_shocker(s)
+                                        for s in self.cfg.enabled_shockers()]
+                        if not self.enabled:
+                            if not self._warned_no_shockers:
+                                self.log("Sit limit reached, but no shockers are "
+                                         "enabled. Add one in the Shockers tab.")
+                                self._warned_no_shockers = True
+                            self._set_status("Sit limit reached - no shockers configured")
+                        else:
+                            self.shock_mode = True
+                            self.shock_mode_started = now
+                            self.warned = False
+                            self.last_action_time = 0.0
+                            self.cur = {s["id"]: {"i": s["start_intensity"],
+                                                  "d": s["start_duration"]}
+                                        for s in self.enabled}
+                            self.log("Sit limit reached -> entering shock mode for "
+                                     f"{len(self.enabled)} shocker(s).")
 
-                    # runaway guard
-                    if (now - self.shock_mode_started) > self.cfg.safety_timeout_minutes * 60.0:
-                        self.log("Safety timeout reached - auto-disarming. Check on yourself!")
-                        self._set_status("SAFETY TIMEOUT - disarmed")
-                        break
+                    if self.shock_mode:
+                        # runaway guard
+                        if (now - self.shock_mode_started) > self.cfg.safety_timeout_minutes * 60.0:
+                            self.log("Safety timeout reached - auto-disarming. "
+                                     "Check on yourself!")
+                            self._set_status("SAFETY TIMEOUT - disarmed")
+                            break
 
-                    # optional pre-shock warning
-                    if self.cfg.warn_before_shock and not self.warned and self.last_action_time == 0.0:
-                        self._fire_async(self.client.vibrate,
-                                         min(30, self.cfg.start_intensity), 1)
-                        self.warned = True
-                        self.warn_time = now
-                        self._set_status("WARNING buzz - stand up now!")
+                        # optional pre-shock warning (buzz every enabled shocker)
+                        if self.cfg.warn_before_shock and not self.warned \
+                                and self.last_action_time == 0.0:
+                            warn_cmds = [(s["id"], OP_VIBRATE,
+                                          min(30, s["start_intensity"]), 1)
+                                         for s in self.enabled]
+                            self._fire_async(self.client.operate, warn_cmds)
+                            self.warned = True
+                            self.warn_time = now
+                            self._set_status("WARNING buzz - stand up now!")
 
-                    # time to act?
-                    if self.last_action_time == 0.0:
-                        # first shock fires after the warning lead time
-                        ready = (not self.cfg.warn_before_shock) or \
-                                (now - getattr(self, "warn_time", now) >= self.cfg.warn_lead_seconds)
-                        if ready:
+                        # time to act?
+                        if self.last_action_time == 0.0:
+                            ready = (not self.cfg.warn_before_shock) or \
+                                    (now - getattr(self, "warn_time", now)
+                                     >= self.cfg.warn_lead_seconds)
+                            if ready:
+                                self._deliver(now)
+                        elif (now - self.last_action_time) >= self.cfg.escalation_interval_s:
+                            self._escalate()
                             self._deliver(now)
-                    elif (now - self.last_action_time) >= self.cfg.escalation_interval_s:
-                        self._escalate()
-                        self._deliver(now)
 
                 # update next-event countdown for the GUI
                 next_in = 0.0
@@ -650,14 +731,21 @@ class PoseMonitor(threading.Thread):
                 self._annotate(rgb, posture, sit_acc, sit_limit_s)
 
                 # ----- publish state ----- #
+                summary = ""
+                if self.shock_mode:
+                    parts = []
+                    for s in self.enabled:
+                        c = self.cur.get(s["id"], {})
+                        label = s.get("name") or s["id"]
+                        parts.append(f"{label} {c.get('i', 0)}%/{c.get('d', 0)}s")
+                    summary = ", ".join(parts)
                 with self.state.lock:
                     self.state.frame_rgb = rgb
                     self.state.posture = posture
                     self.state.sit_seconds = sit_acc
                     self.state.stand_seconds = stand_acc
                     self.state.shocking = self.shock_mode
-                    self.state.current_intensity = self.cur_intensity if self.shock_mode else 0
-                    self.state.current_duration = self.cur_duration if self.shock_mode else 0
+                    self.state.shock_summary = summary
                     self.state.next_shock_in = next_in
                     if not self.shock_mode:
                         if posture == "SITTING":
@@ -679,20 +767,27 @@ class PoseMonitor(threading.Thread):
                 pass
 
     def _escalate(self):
-        self.cur_intensity = min(self.cfg.max_intensity,
-                                 self.cur_intensity + self.cfg.intensity_step)
-        self.cur_duration = min(self.cfg.max_duration,
-                                self.cur_duration + self.cfg.duration_step)
+        for s in self.enabled:
+            c = self.cur.get(s["id"])
+            if c is None:
+                continue
+            c["i"] = min(s["max_intensity"], c["i"] + s["intensity_step"])
+            c["d"] = min(s["max_duration"], c["d"] + s["duration_step"])
 
     def _deliver(self, now):
-        i = int(min(self.cur_intensity, self.cfg.max_intensity, ABS_MAX_INTENSITY))
-        d = int(min(self.cur_duration, self.cfg.max_duration, ABS_MAX_DURATION))
-        self._fire_async(self.client.shock, i, d)
+        cmds = []
+        for s in self.enabled:
+            c = self.cur.get(s["id"])
+            if c is None:
+                continue
+            i = int(min(c["i"], s["max_intensity"], ABS_MAX_INTENSITY))
+            d = int(min(c["d"], s["max_duration"], ABS_MAX_DURATION))
+            cmds.append((s["id"], OP_SHOCK, i, d))
+        if cmds:
+            self._fire_async(self.client.operate, cmds)
         self.last_action_time = now
         with self.state.lock:
             self.state.shocking = True
-            self.state.current_intensity = i
-            self.state.current_duration = d
 
     def _annotate(self, rgb, posture, sit_acc, sit_limit_s):
         color = {"SITTING": (255, 180, 0), "STANDING": (0, 200, 0),
@@ -702,8 +797,15 @@ class PoseMonitor(threading.Thread):
         cv2.putText(rgb, f"sat: {mins:5.1f} min", (12, 66),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240, 240, 240), 2)
         if self.shock_mode:
-            cv2.putText(rgb, f"SHOCK {self.cur_intensity}% / {self.cur_duration}s",
-                        (12, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 255), 2)
+            y = 98
+            cv2.putText(rgb, "SHOCKING:", (12, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 255), 2)
+            for s in self.enabled:
+                c = self.cur.get(s["id"], {})
+                y += 28
+                label = (s.get("name") or s["id"])[:14]
+                cv2.putText(rgb, f"{label}: {c.get('i', 0)}% / {c.get('d', 0)}s",
+                            (24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 255), 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -749,13 +851,16 @@ class App(tk.Tk):
         nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         self.tab_main = ttk.Frame(nb)
+        self.tab_shockers = ttk.Frame(nb)
         self.tab_settings = ttk.Frame(nb)
         self.tab_log = ttk.Frame(nb)
         nb.add(self.tab_main, text="Monitor")
+        nb.add(self.tab_shockers, text="Shockers")
         nb.add(self.tab_settings, text="Settings")
         nb.add(self.tab_log, text="Log")
 
         self._build_main_tab()
+        self._build_shockers_tab()
         self._build_settings_tab()
         self._build_log_tab()
 
@@ -777,7 +882,8 @@ class App(tk.Tk):
         self.sit_var = tk.StringVar(value="Sitting time: 0.0 min")
         self.shock_var = tk.StringVar(value="Shock: idle")
         for v in (self.posture_var, self.sit_var, self.shock_var):
-            ttk.Label(right, textvariable=v, font=("Segoe UI", 11)).pack(anchor="w", pady=2)
+            ttk.Label(right, textvariable=v, font=("Segoe UI", 11),
+                      wraplength=280, justify="left").pack(anchor="w", pady=2)
 
         ttk.Separator(right).pack(fill="x", pady=8)
 
@@ -833,24 +939,18 @@ class App(tk.Tk):
         r = section("PiShock account", r)
         r = field_row("Username", "username", r)
         r = field_row("API key", "api_key", r, "from pishock.com -> Account")
-        r = field_row("Shocker ID (optional)", "shocker_id", r, "blank = use first shocker")
-        r = field_row("Share code (optional)", "share_code", r, "not needed for your own device")
         r = field_row("App name (shown in logs)", "app_name", r)
+        ttk.Label(frm, text="Configure which shockers to use (and their per-shocker "
+                  "strength) in the Shockers tab.", foreground="#666").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        r += 1
 
-        r = section("Timing", r)
+        r = section("Timing (applies to all shockers)", r)
         r = field_row("Sit limit (minutes)", "sit_limit_minutes", r, "shocks begin after this")
-        r = field_row("Escalation interval (s)", "escalation_interval_s", r, "intensity rises each step")
+        r = field_row("Escalation interval (s)", "escalation_interval_s", r, "all shockers escalate each step")
         r = field_row("Required break (s standing)", "min_stand_seconds", r, "stand this long to reset")
         r = check_row("Warn (buzz) before first shock", "warn_before_shock", r)
         r = field_row("Warning lead time (s)", "warn_lead_seconds", r)
-
-        r = section("Shock escalation", r)
-        r = field_row("Start intensity (1-100)", "start_intensity", r)
-        r = field_row("Start duration (1-15 s)", "start_duration", r)
-        r = field_row("Intensity step", "intensity_step", r, "added each escalation")
-        r = field_row("Duration step", "duration_step", r, "0 = keep duration fixed")
-        r = field_row("MAX intensity ceiling", "max_intensity", r, "escalation never exceeds")
-        r = field_row("MAX duration ceiling", "max_duration", r, "escalation never exceeds")
 
         r = section("Detection & safety", r)
         r = field_row("Camera index", "camera_index", r, "0 = default webcam")
@@ -875,6 +975,133 @@ class App(tk.Tk):
         self.log_text = tk.Text(self.tab_log, wrap="word", state="disabled",
                                 font=("Consolas", 9))
         self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+
+    # ----- Shockers tab ----- #
+    def _build_shockers_tab(self):
+        outer = ttk.Frame(self.tab_shockers)
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Add shocker", command=self._add_shocker_row).pack(side="left", padx=3)
+        ttk.Button(bar, text="List my shockers", command=self._list_shockers).pack(side="left", padx=3)
+        ttk.Button(bar, text="Save shockers", command=self._save_shockers).pack(side="left", padx=3)
+        ttk.Label(bar, text="Each shocker escalates on its own curve. "
+                  "'List my shockers' prints valid IDs in the Log tab.",
+                  foreground="#666").pack(side="left", padx=10)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        self.shockers_holder = ttk.Frame(canvas)
+        self.shockers_holder.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.shockers_holder, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True, pady=(8, 0))
+        sb.pack(side="right", fill="y")
+
+        self._shocker_vars = [self._mk_shocker_vars(s) for s in self.cfg.shockers]
+        self._render_shocker_rows()
+
+    def _mk_shocker_vars(self, s):
+        return {
+            "id": tk.StringVar(value=str(s.get("id", ""))),
+            "name": tk.StringVar(value=str(s.get("name", ""))),
+            "enabled": tk.BooleanVar(value=bool(s.get("enabled", True))),
+            "start_intensity": tk.StringVar(value=str(s.get("start_intensity", 10))),
+            "start_duration": tk.StringVar(value=str(s.get("start_duration", 1))),
+            "intensity_step": tk.StringVar(value=str(s.get("intensity_step", 5))),
+            "duration_step": tk.StringVar(value=str(s.get("duration_step", 0))),
+            "max_intensity": tk.StringVar(value=str(s.get("max_intensity", 40))),
+            "max_duration": tk.StringVar(value=str(s.get("max_duration", 5))),
+        }
+
+    def _render_shocker_rows(self):
+        for w in self.shockers_holder.winfo_children():
+            w.destroy()
+        if not self._shocker_vars:
+            ttk.Label(self.shockers_holder, foreground="#666", wraplength=620,
+                      text="No shockers yet. Click 'Add shocker', then enter its "
+                           "numeric ID (use 'List my shockers' to find it).").pack(
+                anchor="w", pady=8)
+            return
+
+        def cell(parent, label, var, col, width=7):
+            ttk.Label(parent, text=label).grid(row=0, column=col * 2, sticky="e",
+                                               padx=(8, 2), pady=3)
+            ttk.Entry(parent, textvariable=var, width=width).grid(
+                row=0, column=col * 2 + 1, sticky="w", pady=3)
+
+        for idx, v in enumerate(self._shocker_vars):
+            lf = ttk.LabelFrame(self.shockers_holder, text=f"Shocker {idx + 1}")
+            lf.pack(fill="x", expand=True, pady=5, padx=2)
+
+            top = ttk.Frame(lf)
+            top.pack(fill="x")
+            ttk.Label(top, text="ID").grid(row=0, column=0, sticky="e", padx=(6, 2))
+            ttk.Entry(top, textvariable=v["id"], width=10).grid(row=0, column=1, sticky="w")
+            ttk.Label(top, text="Name").grid(row=0, column=2, sticky="e", padx=(10, 2))
+            ttk.Entry(top, textvariable=v["name"], width=16).grid(row=0, column=3, sticky="w")
+            ttk.Checkbutton(top, text="Enabled", variable=v["enabled"]).grid(
+                row=0, column=4, padx=12)
+            ttk.Button(top, text="Remove",
+                       command=lambda i=idx: self._remove_shocker_row(i)).grid(
+                row=0, column=5, padx=6)
+
+            p = ttk.Frame(lf)
+            p.pack(fill="x", pady=(2, 4))
+            cell(p, "Start %", v["start_intensity"], 0)
+            cell(p, "Start s", v["start_duration"], 1)
+            cell(p, "Int step", v["intensity_step"], 2)
+            cell(p, "Dur step", v["duration_step"], 3)
+            cell(p, "Max %", v["max_intensity"], 4)
+            cell(p, "Max s", v["max_duration"], 5)
+
+    def _add_shocker_row(self):
+        s = dict(DEFAULT_SHOCKER)
+        s["name"] = f"Shocker {len(self._shocker_vars) + 1}"
+        self._shocker_vars.append(self._mk_shocker_vars(s))
+        self._render_shocker_rows()
+
+    def _remove_shocker_row(self, idx):
+        if 0 <= idx < len(self._shocker_vars):
+            self._shocker_vars.pop(idx)
+            self._render_shocker_rows()
+
+    def _read_shocker_vars(self):
+        out = []
+        for v in self._shocker_vars:
+            def num(key, default):
+                try:
+                    return int(float(v[key].get()))
+                except (ValueError, TypeError):
+                    return default
+            out.append({
+                "id": v["id"].get().strip(),
+                "name": v["name"].get().strip(),
+                "enabled": bool(v["enabled"].get()),
+                "start_intensity": num("start_intensity", 10),
+                "start_duration": num("start_duration", 1),
+                "intensity_step": num("intensity_step", 5),
+                "duration_step": num("duration_step", 0),
+                "max_intensity": num("max_intensity", 40),
+                "max_duration": num("max_duration", 5),
+            })
+        return out
+
+    def _save_shockers(self):
+        self.cfg.shockers = self._read_shocker_vars()
+        self.cfg.save()                 # clamps each shocker
+        self.client.cfg = self.cfg
+        # refresh the editor with the clamped values
+        self._shocker_vars = [self._mk_shocker_vars(s) for s in self.cfg.shockers]
+        self._render_shocker_rows()
+        self.log(f"Saved {len(self.cfg.shockers)} shocker(s).")
+        messagebox.showinfo("Saved", f"Saved {len(self.cfg.shockers)} shocker(s).")
+
+    def _list_shockers(self):
+        threading.Thread(target=self.client.list_shockers, daemon=True).start()
 
     # ----- settings IO ----- #
     def save_settings(self):
@@ -908,13 +1135,19 @@ class App(tk.Tk):
                 var.set(bool(v))
             else:
                 var.set(str(v))
+        # refresh the Shockers tab too
+        if hasattr(self, "shockers_holder"):
+            self._shocker_vars = [self._mk_shocker_vars(s) for s in self.cfg.shockers]
+            self._render_shocker_rows()
 
     # ----- controls ----- #
     def start(self):
         if not (_CV_OK and _MP_OK):
             messagebox.showerror("Missing dependencies",
                                  "Install requirements first:\n\n"
-                                 "pip install opencv-python mediapipe pillow requests")
+                                 'pip install "numpy<2" '
+                                 '"opencv-contrib-python==4.10.0.84" '
+                                 '"mediapipe==0.10.21" websocket-client pillow requests')
             return
         if self.monitor and self.monitor.is_alive():
             return
@@ -958,7 +1191,7 @@ class App(tk.Tk):
             if op == OP_BEEP:
                 self.client.beep(1)
             elif op == OP_VIBRATE:
-                self.client.vibrate(min(20, self.cfg.start_intensity), 1)
+                self.client.vibrate(15, 1)
         threading.Thread(target=run, daemon=True).start()
 
     # ----- logging ----- #
@@ -983,8 +1216,7 @@ class App(tk.Tk):
             posture = self.state.posture
             sit_s = self.state.sit_seconds
             shocking = self.state.shocking
-            ci = self.state.current_intensity
-            cd = self.state.current_duration
+            summary = self.state.shock_summary
             status = self.state.status_text
             nxt = self.state.next_shock_in
 
@@ -1003,7 +1235,8 @@ class App(tk.Tk):
         self.posture_var.set(f"Posture: {posture}")
         self.sit_var.set(f"Sitting time: {sit_s/60:.1f} min")
         if shocking:
-            self.shock_var.set(f"SHOCK {ci}% / {cd}s  (next in {nxt:.0f}s)")
+            self.shock_var.set(f"SHOCKING: {summary}  (next in {nxt:.0f}s)"
+                               if summary else f"SHOCKING (next in {nxt:.0f}s)")
         else:
             self.shock_var.set("Shock: idle")
 
